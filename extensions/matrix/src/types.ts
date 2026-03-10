@@ -95,6 +95,10 @@ export type MatrixConfig = {
   rooms?: Record<string, MatrixRoomConfig>;
   /** Per-action tool gating (default: true for all). */
   actions?: MatrixActionConfig;
+  /** Enable block-level streaming of interstitial replies (tool results, intermediate messages).
+   *  When true, replies are sent as they are generated rather than batched at the end.
+   *  Default: true (enabled). Set to false to batch all replies until the final response. */
+  blockStreaming?: boolean;
 };
 
 export type CoreConfig = {

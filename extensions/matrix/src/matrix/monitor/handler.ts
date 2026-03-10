@@ -44,6 +44,20 @@ import { resolveMatrixThreadRootId, resolveMatrixThreadTarget } from "./threads.
 import type { MatrixRawEvent, RoomMessageEventContent } from "./types.js";
 import { EventType, RelationType } from "./types.js";
 
+const TOOL_PROGRESS_UPDATE_MIN_MS = 800;
+
+function formatToolProgressText(count: number, latestToolName?: string): string {
+  const base = `⚙️ Working… ${count} tool call${count === 1 ? "" : "s"} so far`;
+  const latest = latestToolName?.trim();
+  return latest ? `${base} (${latest})` : base;
+}
+
+function formatToolProgressHtml(count: number, latestToolName?: string): string {
+  const base = `⚙️ <em>Working… ${count} tool call${count === 1 ? "" : "s"} so far</em>`;
+  const latest = latestToolName?.trim();
+  return latest ? `${base} <em>(${latest})</em>` : base;
+}
+
 export type MatrixMonitorHandlerParams = {
   client: MatrixClient;
   core: PluginRuntime;
@@ -75,6 +89,7 @@ export type MatrixMonitorHandlerParams = {
   ) => Promise<{ name?: string; canonicalAlias?: string; altAliases: string[] }>;
   getMemberDisplayName: (roomId: string, userId: string) => Promise<string>;
   accountId?: string | null;
+  blockStreaming?: boolean;
 };
 
 export function resolveMatrixBaseRouteSession(params: {
@@ -151,6 +166,7 @@ export function createMatrixRoomMessageHandler(params: MatrixMonitorHandlerParam
     getRoomInfo,
     getMemberDisplayName,
     accountId,
+    blockStreaming,
   } = params;
   const resolvedAccountId = accountId?.trim() || DEFAULT_ACCOUNT_ID;
   const pairing = createScopedPairingAccess({
@@ -675,6 +691,11 @@ export function createMatrixRoomMessageHandler(params: MatrixMonitorHandlerParam
       }
 
       let didSendReply = false;
+      let toolProgressMessageId: string | undefined;
+      let toolProgressCount = 0;
+      let lastToolProgressUpdateAt = 0;
+      let pendingToolProgressUpdate: Promise<void> | null = null;
+      let toolProgressUnsubscribe: (() => void) | undefined;
       const tableMode = core.channel.text.resolveMarkdownTableMode({
         cfg,
         channel: "matrix",
@@ -686,6 +707,52 @@ export function createMatrixRoomMessageHandler(params: MatrixMonitorHandlerParam
         channel: "matrix",
         accountId: route.accountId,
       });
+      const updateToolProgress = async (latestToolName?: string) => {
+        toolProgressCount += 1;
+        const now = Date.now();
+        if (now - lastToolProgressUpdateAt < TOOL_PROGRESS_UPDATE_MIN_MS) {
+          return;
+        }
+        lastToolProgressUpdateAt = now;
+        const text = formatToolProgressText(toolProgressCount, latestToolName);
+        const html = formatToolProgressHtml(toolProgressCount, latestToolName);
+        if (!toolProgressMessageId) {
+          try {
+            const sent = await client.sendMessage(roomId, {
+              msgtype: "m.text",
+              body: text,
+              format: "org.matrix.custom.html",
+              formatted_body: html,
+            });
+            toolProgressMessageId = sent;
+          } catch (err) {
+            logVerboseMessage(`matrix tool-progress initial send failed: ${String(err)}`);
+          }
+          return;
+        }
+        try {
+          await client.sendMessage(roomId, {
+            msgtype: "m.text",
+            body: `* ${text}`,
+            format: "org.matrix.custom.html",
+            formatted_body: `* ${html}`,
+            "m.new_content": {
+              msgtype: "m.text",
+              body: text,
+              format: "org.matrix.custom.html",
+              formatted_body: html,
+            },
+            "m.relates_to": {
+              rel_type: "m.replace",
+              event_id: toolProgressMessageId,
+            },
+          });
+        } catch (err) {
+          logVerboseMessage(`matrix tool-progress edit failed: ${String(err)}`);
+        }
+      };
+      // toolProgressUnsubscribe is unused with the onToolStart approach but kept for cleanup consistency
+      toolProgressUnsubscribe = () => undefined;
       const typingCallbacks = createTypingCallbacks({
         start: () => sendTypingMatrix(roomId, true, undefined, client),
         stop: () => sendTypingMatrix(roomId, false, undefined, client),
@@ -736,16 +803,27 @@ export function createMatrixRoomMessageHandler(params: MatrixMonitorHandlerParam
         cfg,
         ctxPayload,
         dispatcher,
-        onSettled: () => {
+        onSettled: async () => {
+          if (pendingToolProgressUpdate) {
+            await pendingToolProgressUpdate;
+          }
+          toolProgressUnsubscribe?.();
           markDispatchIdle();
         },
         replyOptions: {
           ...replyOptions,
           skillFilter: roomConfig?.skills,
           onModelSelected,
+          disableBlockStreaming:
+            typeof blockStreaming === "boolean" ? !blockStreaming : false,
+          onToolStart: ({ name, phase }: { name?: string; phase?: string }) => {
+            if (phase === "update") return;
+            pendingToolProgressUpdate = updateToolProgress(name).catch(() => undefined);
+          },
         },
       });
       if (!queuedFinal) {
+        toolProgressUnsubscribe?.();
         return;
       }
       didSendReply = true;
